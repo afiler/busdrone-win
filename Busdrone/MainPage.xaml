@@ -22,8 +22,12 @@
             ZoomLevel="13"
             Center="47.606395,-122.333136"
             ZoomBarVisibility="Visible"
-            />
-
+            >
+        </my:Map>
+        <StackPanel Height="100" HorizontalAlignment="Left" Margin="0,0,0,0" Name="infoPanel" VerticalAlignment="Top" Width="480" Opacity="0.7" Background="Black" Visibility="Collapsed">
+            <TextBlock Height="63" Name="routeText" Text="49" Width="450" VerticalAlignment="Bottom" FontSize="50" />
+            <TextBlock Height="30" Name="routeDescription" Text="UNIVERSITY DISTRICT" Width="450" />
+        </StackPanel>
     </Grid>
 
 </phone:PhoneApplicationPage>

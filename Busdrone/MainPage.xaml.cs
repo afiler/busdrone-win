@@ -18,12 +18,16 @@ using System.Device.Location;
 using System.Collections.ObjectModel;
 using WebSocket4Net;
 using Newtonsoft.Json;
+using System.Threading;
 
 namespace Busdrone
 {
     public class Request
     {
-
+        public String type;
+        public String trip_uid;
+        public double lat, lon, lat_delta, lon_delta;
+        public double zoom;
     }
 
     public class VehicleReport
@@ -48,6 +52,11 @@ namespace Busdrone
 	    public double lon;
 	    public double heading;
         public long timestamp;
+
+        public String tripUid
+        {
+            get { return dataProvider + "/" + tripId; }
+        }
     }
 
     public class Event
@@ -64,12 +73,22 @@ namespace Busdrone
     {
         WebSocket websocket;
         Dictionary<String, Pushpin> markers = new Dictionary<String, Pushpin>();
+        Dictionary<String, MapPolyline> tripPolylines = new Dictionary<String, MapPolyline>();
         GeoCoordinateWatcher watcher;
         bool positionSet = false;
+        String selectedTripUid;
+
+        Timer reconnectTimer;
+        Random rnd1 = new Random();
 
         public MainPage()
         {
             InitializeComponent();
+
+            map.MouseLeftButtonUp += new MouseButtonEventHandler(OnMapClick);
+            //map.MapPan += new EventHandler<MapDragEventArgs>(OnMapPan);
+            //map.MapResolved += new EventHandler<MapDragEventArgs>(OnMapPan);
+            //map.Tap += new EventHandler<GestureEventArgs>(OnMapClick);
 
             watcher = new GeoCoordinateWatcher(GeoPositionAccuracy.Default);
             watcher.MovementThreshold = 20; // 20 meters
@@ -77,19 +96,25 @@ namespace Busdrone
             watcher.Start();
 
             websocket = new WebSocket("ws://busdrone.com:28737/");
-            websocket.MessageReceived += new EventHandler<MessageReceivedEventArgs>(OnMessage);
-            websocket.Opened += new EventHandler(OnOpen);
+            websocket.MessageReceived += new EventHandler<MessageReceivedEventArgs>(OnWsMessage);
+            websocket.Opened += new EventHandler(OnWsOpen);
+            websocket.Closed += new EventHandler(OnWsClose);
             websocket.Open();
+
+            // Check websocket is connected every 10-20 seconds
+            TimerCallback onReconnectCallback = OnReconnectTimer;
+            reconnectTimer = new Timer(onReconnectCallback, null, (10 + rnd1.Next(10)) * 1000, (10 + rnd1.Next(10)) * 1000);
         }
 
-        private void OnOpen(Object sender, EventArgs e)
+        private void OnWsOpen(Object sender, EventArgs e)
         {
             Debug.WriteLine("Websocket open");
         }
 
-        private void OnMessage(object sender, MessageReceivedEventArgs e)
+        private void OnWsMessage(Object sender, MessageReceivedEventArgs e)
         {
             var wsEvent = JsonConvert.DeserializeObject<Event>(e.Message);
+
             if (wsEvent.type == "init") {
                 foreach (VehicleReport v in wsEvent.vehicles)
                     AddOrUpdateVehicle(v);
@@ -100,7 +125,20 @@ namespace Busdrone
             }
             else if (wsEvent.type == "trip_polyline")
             {
+                Debug.WriteLine("Message: " + wsEvent.type);
+                AddPolyline(wsEvent.polyline, wsEvent.trip_uid);
             }
+        }
+
+        private void OnWsClose(Object sender, EventArgs e)
+        {
+
+        }
+
+        private void OnReconnectTimer(Object stateInfo)
+        {
+            if (websocket.State == WebSocketState.Closed)
+                websocket.Open();
         }
 
         private void AddOrUpdateVehicle(VehicleReport v)
@@ -123,7 +161,11 @@ namespace Busdrone
                     p.Height = 30;
                     p.PositionOrigin = PositionOrigin.Center;
                     //p.MouseLeftButtonUp += new MouseButtonEventHandler(OnMarkerClick);
-                    p.MouseLeftButtonUp += new MouseButtonEventHandler((object sender, MouseButtonEventArgs e)=>
+                    /*p.MouseLeftButtonUp += new MouseButtonEventHandler((object sender, MouseButtonEventArgs e)=>
+                    {
+                        OnMarkerClick(p, v);
+                    });*/
+                    p.Tap += new EventHandler<GestureEventArgs>((object sender, GestureEventArgs e) =>
                     {
                         OnMarkerClick(p, v);
                     });
@@ -146,11 +188,41 @@ namespace Busdrone
             markers.Remove(uid);
         }
 
+        void OnMapPan(object sender, EventArgs e)
+        {
+            Request request = new Request
+            {
+                type = "location",
+                lat = map.Center.Latitude,
+                lon = map.Center.Longitude,
+                zoom = map.ZoomLevel
+            };
+
+            String json = JsonConvert.SerializeObject(request);
+            Debug.WriteLine("Request: " + json);
+            websocket.Send(json);
+        }
+
+        void OnMapClick(object sender, MouseButtonEventArgs e)
+        //void OnMapClick(object sender, GestureEventArgs e)
+        {
+            Debug.WriteLine("OnMapClick");
+            infoPanel.Visibility = Visibility.Collapsed;
+            routeText.Text = "";
+            routeDescription.Text = "";
+            ClearTripPolyline();
+        }
+
         void OnMarkerClick(Pushpin p, VehicleReport v)
         {
             Debug.WriteLine("OnMarkerClick: "+v.uid);
             //p.Width = 200;
             //p.Content = v.route + " " + v.destination;
+            routeText.Text = v.route;
+            routeDescription.Text = v.destination;
+            infoPanel.Visibility = Visibility.Visible;
+
+            RequestTripPolyline(v.tripUid);
         }
 
         void OnPositionChanged(object sender, GeoPositionChangedEventArgs<GeoCoordinate> e)
@@ -159,6 +231,61 @@ namespace Busdrone
                 map.Center = e.Position.Location;
                 positionSet = true;
             }
+        }
+
+        void RequestTripPolyline(String tripUid)
+        {
+            Debug.WriteLine("RequestTripPolyline(" + tripUid + ")");
+
+            ClearTripPolyline();
+            selectedTripUid = tripUid;
+
+            if (tripPolylines.ContainsKey(tripUid)) {
+                ShowSelectedTripPolyline();
+            } else {
+                Request request = new Request
+                {
+                    type = "trip_polyline",
+                    trip_uid = tripUid
+                };
+
+                String json = JsonConvert.SerializeObject(request);
+                Debug.WriteLine("Request: " + json);
+                websocket.Send(json);
+            }
+        }
+
+        void ClearTripPolyline()
+        {
+            String tripUid = selectedTripUid;
+            if (tripUid == null) return;
+            
+            map.Children.Remove(tripPolylines[tripUid]);
+        }
+
+        void AddPolyline(String encodedString, String tripUid) {
+            Debug.WriteLine("AddPolyline for " + tripUid + ": "+encodedString);
+
+            Dispatcher.BeginInvoke(() =>
+            {
+                MapPolyline polyline = new MapPolyline();
+                polyline.Stroke = new System.Windows.Media.SolidColorBrush(Colors.Black);
+                polyline.StrokeThickness = 5;
+                polyline.Opacity = 0.5;
+                polyline.Locations = DecodePolylineString(encodedString);
+                tripPolylines[tripUid] = polyline;
+            });
+            ShowSelectedTripPolyline();
+        }
+
+        void ShowSelectedTripPolyline()
+        {
+            Dispatcher.BeginInvoke(() =>
+            {
+                String tripUid = selectedTripUid;
+                MapPolyline polyline = tripPolylines[selectedTripUid];
+                map.Children.Add(polyline);
+            });
         }
 
         public Color ConvertStringToColor(String hex)
@@ -186,6 +313,61 @@ namespace Busdrone
             b = byte.Parse(hex.Substring(start + 4, 2), System.Globalization.NumberStyles.HexNumber);
 
             return Color.FromArgb(a, r, g, b);
+        }
+  
+        public static LocationCollection DecodePolylineString(string encodedPoints)
+        {
+            if (string.IsNullOrEmpty(encodedPoints))
+                throw new ArgumentNullException("encodedPoints");
+
+            LocationCollection locationCollection = new LocationCollection();
+
+            char[] polylineChars = encodedPoints.ToCharArray();
+            int index = 0;
+
+            int currentLat = 0;
+            int currentLng = 0;
+            int next5bits;
+            int sum;
+            int shifter;
+
+            while (index < polylineChars.Length)
+            {
+                // calculate next latitude
+                sum = 0;
+                shifter = 0;
+                do
+                {
+                    next5bits = (int)polylineChars[index++] - 63;
+                    sum |= (next5bits & 31) << shifter;
+                    shifter += 5;
+                } while (next5bits >= 32 && index < polylineChars.Length);
+
+                if (index >= polylineChars.Length)
+                    break;
+
+                currentLat += (sum & 1) == 1 ? ~(sum >> 1) : (sum >> 1);
+
+                //calculate next longitude
+                sum = 0;
+                shifter = 0;
+                do
+                {
+                    next5bits = (int)polylineChars[index++] - 63;
+                    sum |= (next5bits & 31) << shifter;
+                    shifter += 5;
+                } while (next5bits >= 32 && index < polylineChars.Length);
+
+                if (index >= polylineChars.Length && next5bits >= 32)
+                    break;
+
+                currentLng += (sum & 1) == 1 ? ~(sum >> 1) : (sum >> 1);
+
+                //yield return new GeoCoordinate(Convert.ToDouble(currentLat) / 1E5, Convert.ToDouble(currentLng) / 1E5);
+                locationCollection.Add(new GeoCoordinate(Convert.ToDouble(currentLat) / 1E5, Convert.ToDouble(currentLng) / 1E5));
+            }
+
+            return locationCollection;
         }
     }
 }
